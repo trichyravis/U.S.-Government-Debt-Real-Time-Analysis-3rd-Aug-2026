@@ -1,8 +1,8 @@
-
 from __future__ import annotations
 
 from datetime import date, timedelta
 import io
+from io import StringIO
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -103,20 +103,68 @@ def load_curve(years):
     if not frames: raise ValueError("Treasury curve feed returned no data.")
     return pd.concat(frames).drop_duplicates("Date").set_index("Date").sort_index()[MATURITY_ORDER]
 
+@st.cache_data(ttl=21600,show_spinner=False)
+def load_foreign_holders():
+    """Latest Treasury TIC Major Foreign Holders table, billions of dollars."""
+    url="https://ticdata.treasury.gov/resource-center/data-chart-center/tic/Documents/slt_table5.html"
+    response=requests.get(url,timeout=25); response.raise_for_status(); tables=pd.read_html(StringIO(response.text))
+    table=max(tables,key=lambda x:len(x))
+    table.columns=[" ".join(str(v) for v in c if str(v)!="nan").strip() if isinstance(c,tuple) else str(c) for c in table.columns]
+    country_col=next(c for c in table.columns if "country" in c.lower())
+    value_cols=[c for c in table.columns if c!=country_col and pd.to_numeric(table[c],errors="coerce").notna().sum()>3]
+    if not value_cols: raise ValueError("TIC table did not contain a numeric holdings column.")
+    latest_col=value_cols[0]
+    out=table[[country_col,latest_col]].rename(columns={country_col:"Country",latest_col:"Holdings ($bn)"})
+    out["Country"]=out["Country"].astype(str).str.replace(r"\s*\d+/.*$","",regex=True).str.strip(); out["Holdings ($bn)"]=pd.to_numeric(out["Holdings ($bn)"],errors="coerce")
+    out=out.dropna().query("`Holdings ($bn)` > 0"); out=out[~out["Country"].str.contains("Total|All Other|Grand",case=False,na=False)]
+    return out.sort_values("Holdings ($bn)",ascending=False),str(latest_col)
+
+@st.cache_data(ttl=21600,show_spinner=False)
+def load_stakeholder_holdings():
+    """Latest Federal Reserve Financial Accounts F3.2.s holder levels, $bn."""
+    url="https://www.federalreserve.gov/releases/z1/current/html/F3_2_s.htm"
+    response=requests.get(url,timeout=25); response.raise_for_status(); tables=pd.read_html(StringIO(response.text))
+    table=next(t for t in tables if any("Series" in str(c) for c in t.columns) and len(t)>10)
+    table.columns=[" ".join(str(v) for v in c if str(v)!="nan").strip() if isinstance(c,tuple) else str(c) for c in table.columns]
+    series_col=next(c for c in table.columns if "series" in c.lower()); desc_col=next(c for c in table.columns if "description" in c.lower())
+    numeric_cols=[c for c in table.columns if c not in [series_col,desc_col] and "line" not in c.lower() and pd.to_numeric(table[c],errors="coerce").notna().sum()>5]
+    if not numeric_cols: raise ValueError("Federal Reserve table did not contain quarterly levels.")
+    latest_col=numeric_cols[-1]
+    targets={
+        "LM153061105":"Households & nonprofits","FL103061103":"Nonfinancial corporations","FL113061003":"Noncorporate business","FL213061103":"State & local governments","FL763061100":"U.S.-chartered banks","FL743061103":"Affiliated-area banks","FL753061103":"Foreign banking offices","FL403061105":"Government-sponsored enterprises","FL583061105":"Insurance & pension funds","FL473061105":"Credit unions","FL663061105":"Brokers & dealers","FL633061105":"Money market funds","FL653061105":"Mutual funds","FL553061103":"Closed-end funds","FL563061103":"ETFs","FL673061103":"Asset-backed issuers","FL733061103":"Holding companies","FL263061105":"Rest of world","FL713061103":"Federal Reserve","FL503061123":"Other financial business",
+    }
+    rows=[]
+    for code,label in targets.items():
+        match=table[table[series_col].astype(str).str.contains(code,regex=False,na=False)]
+        if not match.empty:
+            value=pd.to_numeric(match.iloc[0][latest_col],errors="coerce")
+            if pd.notna(value): rows.append({"Stakeholder":label,"Holdings ($bn)":float(value)})
+    if len(rows)<5: raise ValueError("Federal Reserve holder rows could not be identified.")
+    out=pd.DataFrame(rows)
+    category_map={"U.S.-chartered banks":"Banks & credit unions","Affiliated-area banks":"Banks & credit unions","Foreign banking offices":"Banks & credit unions","Credit unions":"Banks & credit unions","Mutual funds":"Investment funds","Money market funds":"Investment funds","Closed-end funds":"Investment funds","ETFs":"Investment funds","Insurance & pension funds":"Insurance & pensions","Households & nonprofits":"Households & nonprofits","Nonfinancial corporations":"Businesses","Noncorporate business":"Businesses","State & local governments":"State & local governments","Government-sponsored enterprises":"Other financial institutions","Brokers & dealers":"Other financial institutions","Asset-backed issuers":"Other financial institutions","Holding companies":"Other financial institutions","Other financial business":"Other financial institutions","Rest of world":"Rest of world","Federal Reserve":"Federal Reserve"}
+    out["Category"]=out["Stakeholder"].map(category_map).fillna("Other")
+    grouped=out.groupby("Category",as_index=False)["Holdings ($bn)"].sum().sort_values("Holdings ($bn)",ascending=False)
+    return grouped,out,str(latest_col)
+
 def demo_data(years):
     rng=np.random.default_rng(27); idx=pd.bdate_range(end=pd.Timestamp.today(),periods=max(252*years,260)); total=np.linspace(31e12,38e12,len(idx))+np.cumsum(rng.normal(0,9e9,len(idx))); public=total*.79+np.cumsum(rng.normal(0,1e9,len(idx))); debt=pd.DataFrame({"debt_held_public_amt":public,"intragov_hold_amt":total-public,"tot_pub_debt_out_amt":total},index=idx)
     annual_idx=pd.date_range("1995-09-30",pd.Timestamp.today(),freq="YE-SEP"); hist=pd.DataFrame({"debt_outstanding_amt":5e12*np.exp(np.linspace(0,np.log(7.4),len(annual_idx)))},index=annual_idx)
     curve_base=np.array([4.4,4.35,4.25,4.1,4.0,3.95,4.05,4.2,4.4,4.85,4.78]); curve=pd.DataFrame([curve_base+rng.normal(0,.12,len(curve_base)) for _ in idx],index=idx,columns=MATURITY_ORDER)
     interest=pd.DataFrame({"record_date":pd.date_range(end=pd.Timestamp.today(),periods=years*12,freq="ME"),"interest_expense_amt":np.linspace(45e9,90e9,years*12)}); return debt,hist,interest,"interest_expense_amt",curve
 
-def excel_download(debt,historical,interest,interest_col,curve,source):
+def demo_holders():
+    countries=pd.DataFrame({"Country":["Japan","China","United Kingdom","Belgium","Luxembourg","Cayman Islands","Canada","France","Ireland","Switzerland"],"Holdings ($bn)":[1130,780,760,410,405,390,365,345,330,300]})
+    stakeholders=pd.DataFrame({"Category":["Rest of world","Investment funds","Households & nonprofits","Federal Reserve","Insurance & pensions","Banks & credit unions","State & local governments","Businesses","Other financial institutions"],"Holdings ($bn)":[8900,5200,3040,4300,1800,1600,1500,300,1200]})
+    return countries,"Classroom snapshot",stakeholders,stakeholders.copy(),"Classroom quarter"
+
+def excel_download(debt,historical,interest,interest_col,curve,countries,stakeholders,source):
     out=io.BytesIO()
     with pd.ExcelWriter(out,engine="xlsxwriter",datetime_format="dd-mmm-yyyy") as writer:
         book=writer.book; title=book.add_format({"bold":True,"font_color":"#FFFFFF","bg_color":NAVY,"font_size":18}); header=book.add_format({"bold":True,"font_color":"#FFFFFF","bg_color":NAVY,"align":"center"}); currency=book.add_format({"num_format":"$#,##0,,\"M\";[Red]($#,##0,,\"M\")"}); note_fmt=book.add_format({"bg_color":"#FFF1B8","font_color":NAVY,"text_wrap":True})
         latest=debt.iloc[-1]; summary=book.add_worksheet("Debt Dashboard"); summary.hide_gridlines(2); summary.set_column("A:A",30); summary.set_column("B:B",22); summary.merge_range("A1:F1","U.S. Government Debt Analytics",title); summary.write("A3","Latest official date",header); summary.write_datetime("B3",debt.index[-1].to_pydatetime(),book.add_format({"num_format":"dd-mmm-yyyy"})); labels=[("Total public debt outstanding",latest["tot_pub_debt_out_amt"]),("Debt held by the public",latest["debt_held_public_amt"]),("Intragovernmental holdings",latest["intragov_hold_amt"])]
         for i,(label,value) in enumerate(labels,5): summary.write(i,0,label); summary.write_number(i,1,value,currency)
         summary.merge_range("D3:F8",f"Source: {source}. Debt to the Penny is reported daily with the previous business day's data. Educational analysis only.",note_fmt)
-        for name,df in [("Daily Debt",debt.reset_index()),("Historical FY Debt",historical.reset_index()),("Interest Expense",interest),("Treasury Curve",curve.reset_index())]:
+        for name,df in [("Daily Debt",debt.reset_index()),("Historical FY Debt",historical.reset_index()),("Interest Expense",interest),("Treasury Curve",curve.reset_index()),("Foreign Holders",countries),("Stakeholder Holdings",stakeholders)]:
             df.to_excel(writer,sheet_name=name,index=False,startrow=1); ws=writer.sheets[name]; ws.freeze_panes(2,1); ws.autofilter(1,0,len(df)+1,len(df.columns)-1); ws.merge_range(0,0,0,len(df.columns)-1,name,title); ws.set_column(0,0,15); ws.set_column(1,len(df.columns)-1,20)
         guide=book.add_worksheet("Learning Guide"); guide.hide_gridlines(2); guide.set_column("A:A",28); guide.set_column("B:B",90); guide.merge_range("A1:B1","U.S. Government Debt Learning Guide",title); guide.write_row("A3",["Concept","Meaning"],header)
         lessons=[("Debt held by the public","Federal debt held outside federal government accounts, including investors, the Federal Reserve, foreign holders and other entities."),("Intragovernmental holdings","Treasury securities held by federal trust funds, revolving funds and special funds."),("Total public debt outstanding","Debt held by the public plus intragovernmental holdings; it is a stock, not the annual deficit."),("Deficit","Annual flow by which spending exceeds revenue; deficits generally add to debt."),("Interest expense","Budget cost influenced by the debt stock, maturity mix and rates at which securities are issued or refinanced."),("Yield curve","Market financing context across Treasury maturities; it is not the same as the government's average interest cost.")]
@@ -150,12 +198,21 @@ else:
         try: curve=load_curve(years)
         except Exception as exc: curve=demo_curve; st.warning(f"Treasury yield-curve data is temporarily unavailable ({exc}). Other official data remains live.")
 
+if use_demo:
+    countries,country_period,stakeholders,stakeholder_detail,stakeholder_period=demo_holders()
+else:
+    demo_countries,demo_country_period,demo_stakeholders,demo_stakeholder_detail,demo_stakeholder_period=demo_holders()
+    try: countries,country_period=load_foreign_holders()
+    except Exception as exc: countries,country_period=demo_countries,demo_country_period; st.warning(f"Country-holder data is temporarily unavailable ({exc}). A clearly labelled classroom snapshot is shown in that tab.")
+    try: stakeholders,stakeholder_detail,stakeholder_period=load_stakeholder_holdings()
+    except Exception as exc: stakeholders,stakeholder_detail,stakeholder_period=demo_stakeholders,demo_stakeholder_detail,demo_stakeholder_period; st.warning(f"Federal Reserve stakeholder data is temporarily unavailable ({exc}). A clearly labelled classroom snapshot is shown in that tab.")
+
 latest=debt.iloc[-1]; comparison=debt.iloc[max(0,len(debt)-growth_window-1)]; debt_change=latest["tot_pub_debt_out_amt"]-comparison["tot_pub_debt_out_amt"]; public_share=latest["debt_held_public_amt"]/latest["tot_pub_debt_out_amt"]
 st.markdown("""<div class='hero'><div class='eyebrow'>The Mountain Path Academy · Sovereign Finance Analytics</div><h1>U.S. Government Debt — Real-Time Analysis & Learning Studio</h1><p>Track the federal debt stock, public versus intragovernmental holdings, long-run growth, interest cost and Treasury financing environment using official government data.</p></div>""",unsafe_allow_html=True)
 k1,k2,k3,k4,k5=st.columns(5); k1.metric("Total federal debt",trillions(latest["tot_pub_debt_out_amt"])); k2.metric("Held by the public",trillions(latest["debt_held_public_amt"])); k3.metric("Intragovernmental",trillions(latest["intragov_hold_amt"])); k4.metric(f"Change · {growth_window}D",trillions(debt_change)); k5.metric("Public share",f"{public_share:.1%}")
 st.caption(f"Latest debt date: {debt.index[-1]:%d %b %Y} · {source}")
 
-tabs=st.tabs(["📊 Analysis", "🧩 Debt composition", "💸 Interest cost", "📈 Financing context", "🎓 Educative", "🧪 Practice & download"])
+tabs=st.tabs(["📊 Analysis", "🧩 Debt composition", "🌍 Who holds the debt?", "💸 Interest cost", "📈 Financing context", "🎓 Educative", "🧪 Practice & download"])
 
 with tabs[0]:
     section("Federal debt dashboard")
@@ -175,6 +232,28 @@ with tabs[1]:
     note("Debt held by the public includes Treasury securities held by investors, Federal Reserve Banks, foreign governments and other entities outside federal government accounts. It is not synonymous with foreign-held debt.",warning=True)
 
 with tabs[2]:
+    section("Who holds marketable U.S. Treasury securities?")
+    note("This ownership view uses Federal Reserve Financial Accounts levels for marketable Treasury securities. It differs from Debt to the Penny in scope, valuation and publication date, so the amounts should not be expected to reconcile exactly.",warning=True)
+    left,right=st.columns([1.25,1])
+    with left:
+        fig=go.Figure(go.Bar(x=stakeholders["Holdings ($bn)"],y=stakeholders["Category"],orientation="h",marker_color=[BLUE,TEAL,GOLD,PURPLE,RED,ORANGE,GREEN,"#64748B","#94A3B8"][:len(stakeholders)])); fig.update_layout(title=f"Investor sectors · latest available {stakeholder_period}"); fig.update_xaxes(title="$ billion"); fig.update_yaxes(categoryorder="total ascending"); st.plotly_chart(style_fig(fig,520),use_container_width=True)
+    with right:
+        fig=go.Figure(go.Pie(labels=stakeholders["Category"],values=stakeholders["Holdings ($bn)"],hole=.55,textinfo="label+percent")); fig.update_layout(title="Share of reported marketable Treasury holdings"); st.plotly_chart(style_fig(fig,520),use_container_width=True)
+    s1,s2,s3,s4=st.columns(4)
+    def holder_value(label):
+        row=stakeholders.loc[stakeholders["Category"]==label,"Holdings ($bn)"]; return float(row.iloc[0]) if not row.empty else 0.0
+    s1.metric("Rest of world",f"${holder_value('Rest of world')/1000:,.2f}T"); s2.metric("Federal Reserve",f"${holder_value('Federal Reserve')/1000:,.2f}T"); s3.metric("Investment funds",f"${holder_value('Investment funds')/1000:,.2f}T"); s4.metric("Households & nonprofits",f"${holder_value('Households & nonprofits')/1000:,.2f}T")
+
+    section("Major foreign holders by country")
+    top_n=st.slider("Number of countries to display",5,20,12,key="country_count")
+    top_countries=countries.head(top_n).sort_values("Holdings ($bn)")
+    fig=go.Figure(go.Bar(x=top_countries["Holdings ($bn)"],y=top_countries["Country"],orientation="h",marker_color=TEAL,text=top_countries["Holdings ($bn)"].map(lambda x:f"${x:,.0f}B"),textposition="outside")); fig.update_layout(title=f"Major foreign holders of U.S. Treasury securities · {country_period}"); fig.update_xaxes(title="$ billion"); st.plotly_chart(style_fig(fig,560),use_container_width=True)
+    c1,c2,c3=st.columns(3); c1.metric("Countries shown",f"{len(top_countries)}"); c2.metric("Top-country holdings",f"${countries.iloc[0]['Holdings ($bn)']:,.1f}B"); c3.metric("Top-country name",str(countries.iloc[0]["Country"]))
+    note("TIC country attribution is generally based on the location of the foreign holder or custodian reported to the system. Holdings routed through financial centres can obscure the ultimate beneficial owner. Country data covers foreign holdings of Treasury securities—not each country's share of total federal debt.",warning=True)
+    with st.expander("Detailed Federal Reserve stakeholder rows"):
+        st.dataframe(stakeholder_detail.style.format({"Holdings ($bn)":"${:,.1f}"}),use_container_width=True,hide_index=True)
+
+with tabs[3]:
     section("Interest expense and refinancing pressure")
     monthly=interest.copy(); monthly["record_date"]=pd.to_datetime(monthly["record_date"]); monthly=monthly.set_index("record_date").sort_index(); series=monthly[interest_col].dropna()
     fig=go.Figure(go.Bar(x=series.index,y=series/1e9,marker_color=RED)); fig.update_layout(title="Reported interest expense on the public debt"); fig.update_yaxes(title="$ billion"); st.plotly_chart(style_fig(fig,480),use_container_width=True)
@@ -182,14 +261,14 @@ with tabs[2]:
     c1,c2,c3=st.columns(3); c1.markdown(card("Debt stock", "More principal outstanding generally raises interest cost, all else equal.",BLUE),unsafe_allow_html=True); c2.markdown(card("Average financing rate", "Interest cost reprices gradually as bills, notes and bonds mature and are refinanced at prevailing rates.",RED),unsafe_allow_html=True); c3.markdown(card("Maturity structure", "A shorter maturity profile transmits rate changes faster; longer maturities lock funding costs for more time.",PURPLE),unsafe_allow_html=True)
     note("Do not divide one monthly expense observation by total debt to infer an annual effective rate. Fiscal-year totals, accrual conventions and average debt balances must be aligned.",warning=True)
 
-with tabs[3]:
+with tabs[4]:
     section("Treasury yield environment")
     current=curve.iloc[-1]; fig=go.Figure(go.Scatter(x=MATURITY_ORDER,y=current.values,mode="lines+markers",line=dict(color=GOLD,width=3),marker=dict(size=9))); fig.update_layout(title=f"Current Treasury par yield curve · {curve.index[-1]:%d %b %Y}"); fig.update_yaxes(title="Yield (%)"); st.plotly_chart(style_fig(fig,450),use_container_width=True)
     fig=go.Figure(go.Scatter(x=curve.index,y=curve[focus_maturity],line=dict(color=BLUE,width=2.5))); fig.update_layout(title=f"{focus_maturity} Treasury yield history"); fig.update_yaxes(title="Yield (%)"); st.plotly_chart(style_fig(fig,430),use_container_width=True)
     spread=(current["10 Yr"]-current["2 Yr"])*100; f1,f2,f3=st.columns(3); f1.metric("Selected yield",f"{current[focus_maturity]:.2f}%"); f2.metric("2s10s spread",f"{spread:+.0f} bp"); f3.metric("Curve date",f"{curve.index[-1]:%d %b %Y}")
     note("Current market yields affect new borrowing immediately and the existing debt stock gradually through refinancing. The par curve is not the government's weighted-average interest rate.")
 
-with tabs[4]:
+with tabs[5]:
     section("Understanding U.S. government debt")
     lessons=[[("Why debt exists","The federal government borrows when spending and other outflows exceed revenues and other inflows. Treasury securities finance the resulting cash need.",BLUE),("Debt held by public","Held outside federal government accounts. This component is central to analysis of market financing needs and macroeconomic crowding-out risk.",TEAL),("Intragovernmental","Claims held by trust funds and other government accounts. They are real Treasury obligations but represent internal government financing relationships.",GOLD)],[("Bills, notes and bonds","Bills mature within one year; notes generally span 2–10 years; bonds extend longer. TIPS and FRNs add inflation-linked and floating-rate structures.",PURPLE),("Debt sustainability","Depends on growth, primary balances, interest rates, inflation, maturity structure and institutional credibility—not on the nominal debt number alone.",RED),("Debt limit","A statutory borrowing constraint; it does not itself authorise spending. Appropriations, revenues and prior obligations determine financing needs.",ORANGE)]]
     for row in lessons:
@@ -201,7 +280,7 @@ with tabs[4]:
     with st.expander("Common misconceptions"):
         st.markdown("- The national debt is not the same as the annual deficit.\n- Debt held by the public is not all foreign-owned.\n- Intragovernmental holdings are not eliminated from total debt outstanding.\n- A household analogy is incomplete because the federal government taxes, issues currency-denominated debt and operates without a fixed lifespan.\n- A rising nominal debt level does not by itself measure sustainability; debt service and economic capacity matter.")
 
-with tabs[5]:
+with tabs[6]:
     section("Knowledge check")
     questions=[("Total public debt outstanding equals…",["debt held by public plus intragovernmental holdings","annual spending minus revenue only","foreign holdings only"],0),("The federal deficit is…",["a flow measured over a period","the same as total debt","Treasury interest rate"],0),("Higher market yields affect interest cost…",["gradually as debt is issued and refinanced","never","only after all debt matures"],0),("Debt held by the public includes…",["domestic, foreign and Federal Reserve holdings outside federal accounts","only foreign governments","only commercial banks"],0)]
     answers=[st.radio(f"{i+1}. {q}",opts,index=None,key=f"q{i}") for i,(q,opts,_) in enumerate(questions)]
@@ -209,7 +288,7 @@ with tabs[5]:
         if any(a is None for a in answers): st.warning("Please answer every question.")
         else: st.success(f"Score: {sum(a==opts[c] for a,(_,opts,c) in zip(answers,questions))}/{len(questions)}")
     section("Download the formatted government-debt workbook")
-    workbook=excel_download(debt,historical,interest,interest_col,curve,source)
+    workbook=excel_download(debt,historical,interest,interest_col,curve,countries,stakeholders,source)
     st.download_button("⬇ Download U.S. Government Debt Analysis",workbook,"US_Government_Debt_Analysis.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
     st.caption("Includes dashboard metrics, daily Debt to the Penny history, fiscal-year debt, interest expense, Treasury curve history and a learning guide.")
 
