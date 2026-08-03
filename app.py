@@ -148,7 +148,9 @@ def load_stakeholder_holdings():
     """Latest Federal Reserve Financial Accounts F3.2.s holder levels, $bn."""
     url="https://www.federalreserve.gov/releases/z1/current/html/F3_2_s.htm"
     response=requests.get(url,timeout=25); response.raise_for_status(); tables=html_tables(response.text)
-    rows=next(t for t in tables if any(any("Series"==cell or "Series" in cell for cell in row) for row in t) and len(t)>10)
+    candidates=[t for t in tables if any(any("Series"==cell or "Series" in cell for cell in row) for row in t) and len(t)>10]
+    if not candidates: raise ValueError("Federal Reserve holdings table was not found.")
+    rows=max(candidates,key=len)
     header_index=next(i for i,row in enumerate(rows) if any("Series"==cell or "Series" in cell for cell in row)); header=rows[header_index]; width=len(header)
     data=[row[:width]+[""]*max(0,width-len(row)) for row in rows[header_index+1:] if len(row)>=3]; table=pd.DataFrame(data,columns=header)
     series_col=next(c for c in table.columns if "series" in c.lower()); desc_col=next(c for c in table.columns if "description" in c.lower())
@@ -156,15 +158,55 @@ def load_stakeholder_holdings():
     if not numeric_cols: raise ValueError("Federal Reserve table did not contain quarterly levels.")
     latest_col=numeric_cols[-1]
     targets={
-        "LM153061105":"Households & nonprofits","FL103061103":"Nonfinancial corporations","FL113061003":"Noncorporate business","FL213061103":"State & local governments","FL763061100":"U.S.-chartered banks","FL743061103":"Affiliated-area banks","FL753061103":"Foreign banking offices","FL403061105":"Government-sponsored enterprises","FL583061105":"Insurance & pension funds","FL473061105":"Credit unions","FL663061105":"Brokers & dealers","FL633061105":"Money market funds","FL653061105":"Mutual funds","FL553061103":"Closed-end funds","FL563061103":"ETFs","FL673061103":"Asset-backed issuers","FL733061103":"Holding companies","FL263061105":"Rest of world","FL713061103":"Federal Reserve","FL503061123":"Other financial business",
+        "LM153061105":("Households & nonprofits",["household sector","households and nonprofit"]),
+        "FL103061103":("Nonfinancial corporations",["nonfinancial corporate business"]),
+        "FL113061003":("Noncorporate business",["nonfinancial noncorporate business"]),
+        "FL213061103":("State & local governments",["state and local governments"]),
+        "FL763061100":("U.S.-chartered banks",["u.s.-chartered depository"]),
+        "FL743061103":("Affiliated-area banks",["banks in u.s.-affiliated areas"]),
+        "FL753061103":("Foreign banking offices",["foreign banking offices"]),
+        "FL403061105":("Government-sponsored enterprises",["government-sponsored enterprises"]),
+        "FL583061105":("Insurance & pension funds",["insurance companies and pension funds"]),
+        "FL473061105":("Credit unions",["credit unions"]),
+        "FL663061105":("Brokers & dealers",["security brokers and dealers"]),
+        "FL633061105":("Money market funds",["money market funds"]),
+        "FL653061105":("Mutual funds",["mutual funds"]),
+        "FL553061103":("Closed-end funds",["closed-end funds"]),
+        "FL563061103":("ETFs",["exchange-traded funds"]),
+        "FL673061103":("Asset-backed issuers",["issuers of asset-backed securities"]),
+        "FL733061103":("Holding companies",["holding companies"]),
+        "FL263061105":("Rest of world",["rest of the world"]),
+        "FL713061103":("Federal Reserve",["monetary authority","federal reserve"]),
+        "FL503061123":("Other financial business",["other financial business"]),
     }
     rows=[]
-    for code,label in targets.items():
+    descriptions=table[desc_col].astype(str).str.lower()
+    for code,(label,phrases) in targets.items():
         match=table[table[series_col].astype(str).str.contains(code,regex=False,na=False)]
+        if match.empty:
+            mask=pd.Series(False,index=table.index)
+            for phrase in phrases: mask=mask|descriptions.str.contains(phrase,regex=False,na=False)
+            match=table[mask]
         if not match.empty:
             value=pd.to_numeric(str(match.iloc[0][latest_col]).replace(",",""),errors="coerce")
             if pd.notna(value): rows.append({"Stakeholder":label,"Holdings ($bn)":float(value)})
-    if len(rows)<5: raise ValueError("Federal Reserve holder rows could not be identified.")
+    if len(rows)<5:
+        # Fallback to the same Federal Reserve Z.1 series distributed through FRED.
+        fred_series={
+            "BOGZ1LM153061105Q":"Households & nonprofits","BOGZ1FL213061103Q":"State & local governments",
+            "BOGZ1FL763061100Q":"U.S.-chartered banks","BOGZ1FL583061105Q":"Insurance & pension funds",
+            "BOGZ1FL633061105Q":"Money market funds","BOGZ1FL653061105Q":"Mutual funds",
+            "BOGZ1FL263061105Q":"Rest of world","BOGZ1FL713061103Q":"Federal Reserve",
+        }
+        fred_url="https://fred.stlouisfed.org/graph/fredgraph.csv?id="+",".join(fred_series)
+        fred_response=requests.get(fred_url,timeout=25); fred_response.raise_for_status(); fred=pd.read_csv(io.StringIO(fred_response.text))
+        rows=[]
+        for series,label in fred_series.items():
+            if series in fred.columns:
+                values=pd.to_numeric(fred[series],errors="coerce").dropna()
+                if not values.empty: rows.append({"Stakeholder":label,"Holdings ($bn)":float(values.iloc[-1])/1000})
+        latest_col="Latest FRED / Federal Reserve Z.1 quarter"
+    if len(rows)<5: raise ValueError("Federal Reserve holder rows could not be identified from either official table format.")
     out=pd.DataFrame(rows)
     category_map={"U.S.-chartered banks":"Banks & credit unions","Affiliated-area banks":"Banks & credit unions","Foreign banking offices":"Banks & credit unions","Credit unions":"Banks & credit unions","Mutual funds":"Investment funds","Money market funds":"Investment funds","Closed-end funds":"Investment funds","ETFs":"Investment funds","Insurance & pension funds":"Insurance & pensions","Households & nonprofits":"Households & nonprofits","Nonfinancial corporations":"Businesses","Noncorporate business":"Businesses","State & local governments":"State & local governments","Government-sponsored enterprises":"Other financial institutions","Brokers & dealers":"Other financial institutions","Asset-backed issuers":"Other financial institutions","Holding companies":"Other financial institutions","Other financial business":"Other financial institutions","Rest of world":"Rest of world","Federal Reserve":"Federal Reserve"}
     out["Category"]=out["Stakeholder"].map(category_map).fillna("Other")
