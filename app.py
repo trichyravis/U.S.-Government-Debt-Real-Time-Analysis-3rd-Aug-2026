@@ -37,6 +37,13 @@ section[data-testid="stSidebar"] label p{color:#F3C84B!important;-webkit-text-fi
 section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [data-baseweb="select"] span,
 section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [data-baseweb="select"] p,
 section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [data-baseweb="select"] svg{color:#071A2F!important;-webkit-text-fill-color:#071A2F!important;fill:#071A2F!important;opacity:1!important}
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [data-baseweb="select"] > div *,
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [role="button"],
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [role="button"] *,
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] input,
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] input::placeholder{color:#071A2F!important;-webkit-text-fill-color:#071A2F!important;caret-color:#071A2F!important;fill:#071A2F!important;stroke:#071A2F!important;font-weight:850!important;opacity:1!important}
+section[data-testid="stSidebar"] div[data-testid="stSelectbox"] [data-baseweb="select"]{background:#FFF!important;color:#071A2F!important;-webkit-text-fill-color:#071A2F!important}
 </style>""", unsafe_allow_html=True)
 
 MATURITY_ORDER=["1 Mo","3 Mo","6 Mo","1 Yr","2 Yr","3 Yr","5 Yr","7 Yr","10 Yr","20 Yr","30 Yr"]
