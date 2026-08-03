@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from datetime import date, timedelta
@@ -57,7 +58,7 @@ def load_debt_history(years):
 
 @st.cache_data(ttl=21600,show_spinner=False)
 def load_historical_debt():
-    df=fiscal_api("v2/accounting/od/historical_debt_outstanding",{"sort":"record_date","page[size]":"500"})
+    df=fiscal_api("v2/accounting/od/debt_outstanding",{"sort":"record_date","page[size]":"500"})
     df["record_date"]=pd.to_datetime(df["record_date"]); df["debt_outstanding_amt"]=pd.to_numeric(df["debt_outstanding_amt"],errors="coerce"); return df.set_index("record_date").sort_index()
 
 @st.cache_data(ttl=21600,show_spinner=False)
@@ -122,9 +123,17 @@ source="U.S. Treasury Fiscal Data + Treasury yield-curve feed"
 if use_demo: debt,historical,interest,interest_col,curve=demo_data(years); source="Reproducible classroom simulation"
 else:
     try:
-        debt=load_debt_history(years); historical=load_historical_debt(); interest,interest_col=load_interest_expense(max(years,3)); curve=load_curve(years)
+        debt=load_debt_history(years)
     except Exception as exc:
-        debt,historical,interest,interest_col,curve=demo_data(years); source="Reproducible classroom simulation"; st.warning(f"An official feed is temporarily unavailable ({exc}). Showing classroom data.")
+        debt,historical,interest,interest_col,curve=demo_data(years); source="Reproducible classroom simulation"; st.warning(f"The primary Debt to the Penny feed is unavailable ({exc}). Showing classroom data.")
+    else:
+        demo_debt,demo_historical,demo_interest,demo_interest_col,demo_curve=demo_data(years)
+        try: historical=load_historical_debt()
+        except Exception as exc: historical=demo_historical; st.warning(f"Historical fiscal-year debt is temporarily unavailable ({exc}). Other official data remains live.")
+        try: interest,interest_col=load_interest_expense(max(years,3))
+        except Exception as exc: interest,interest_col=demo_interest,demo_interest_col; st.warning(f"Interest-expense data is temporarily unavailable ({exc}). Other official data remains live.")
+        try: curve=load_curve(years)
+        except Exception as exc: curve=demo_curve; st.warning(f"Treasury yield-curve data is temporarily unavailable ({exc}). Other official data remains live.")
 
 latest=debt.iloc[-1]; comparison=debt.iloc[max(0,len(debt)-growth_window-1)]; debt_change=latest["tot_pub_debt_out_amt"]-comparison["tot_pub_debt_out_amt"]; public_share=latest["debt_held_public_amt"]/latest["tot_pub_debt_out_amt"]
 st.markdown("""<div class='hero'><div class='eyebrow'>The Mountain Path Academy · Sovereign Finance Analytics</div><h1>U.S. Government Debt — Real-Time Analysis & Learning Studio</h1><p>Track the federal debt stock, public versus intragovernmental holdings, long-run growth, interest cost and Treasury financing environment using official government data.</p></div>""",unsafe_allow_html=True)
