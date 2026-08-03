@@ -1,8 +1,9 @@
+
 from __future__ import annotations
 
 from datetime import date, timedelta
 import io
-from io import StringIO
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 
 import numpy as np
@@ -57,6 +58,29 @@ def style_fig(fig,height=430):
     fig.update_layout(height=height,paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="white",font=dict(family="Inter",color=NAVY),margin=dict(l=35,r=25,t=60,b=35),legend=dict(orientation="h",y=1.08),hovermode="x unified"); fig.update_xaxes(gridcolor="#E7EEF4"); fig.update_yaxes(gridcolor="#E7EEF4"); return fig
 def trillions(x): return f"${x/1e12:,.2f}T"
 
+class _TableParser(HTMLParser):
+    """Small dependency-free HTML table reader for official Treasury/Fed tables."""
+    def __init__(self):
+        super().__init__(); self.tables=[]; self.table=None; self.row=None; self.cell=None
+    def handle_starttag(self,tag,attrs):
+        if tag=="table": self.table=[]
+        elif tag=="tr" and self.table is not None: self.row=[]
+        elif tag in ("td","th") and self.row is not None: self.cell=[]
+    def handle_data(self,data):
+        if self.cell is not None: self.cell.append(data)
+    def handle_endtag(self,tag):
+        if tag in ("td","th") and self.cell is not None:
+            self.row.append(" ".join("".join(self.cell).split())); self.cell=None
+        elif tag=="tr" and self.row is not None:
+            if any(self.row): self.table.append(self.row)
+            self.row=None
+        elif tag=="table" and self.table is not None:
+            if self.table: self.tables.append(self.table)
+            self.table=None
+
+def html_tables(text):
+    parser=_TableParser(); parser.feed(text); return parser.tables
+
 @st.cache_data(ttl=1800,show_spinner=False)
 def fiscal_api(path,params):
     response=requests.get(f"{FISCAL_BASE}/{path}",params=params,timeout=25); response.raise_for_status(); payload=response.json(); data=payload.get("data",[])
@@ -107,15 +131,15 @@ def load_curve(years):
 def load_foreign_holders():
     """Latest Treasury TIC Major Foreign Holders table, billions of dollars."""
     url="https://ticdata.treasury.gov/resource-center/data-chart-center/tic/Documents/slt_table5.html"
-    response=requests.get(url,timeout=25); response.raise_for_status(); tables=pd.read_html(StringIO(response.text))
-    table=max(tables,key=lambda x:len(x))
-    table.columns=[" ".join(str(v) for v in c if str(v)!="nan").strip() if isinstance(c,tuple) else str(c) for c in table.columns]
-    country_col=next(c for c in table.columns if "country" in c.lower())
-    value_cols=[c for c in table.columns if c!=country_col and pd.to_numeric(table[c],errors="coerce").notna().sum()>3]
+    response=requests.get(url,timeout=25); response.raise_for_status(); tables=html_tables(response.text)
+    rows=next(t for t in tables if any(any("Country" in cell for cell in row) for row in t) and len(t)>5)
+    header_index=next(i for i,row in enumerate(rows) if any("Country" in cell for cell in row)); header=rows[header_index]
+    width=len(header); data=[row[:width]+[""]*max(0,width-len(row)) for row in rows[header_index+1:] if len(row)>=2]
+    table=pd.DataFrame(data,columns=header)
+    country_col=next(c for c in table.columns if "country" in c.lower()); value_cols=[c for c in table.columns if c!=country_col and pd.to_numeric(table[c].astype(str).str.replace(",",""),errors="coerce").notna().sum()>3]
     if not value_cols: raise ValueError("TIC table did not contain a numeric holdings column.")
-    latest_col=value_cols[0]
-    out=table[[country_col,latest_col]].rename(columns={country_col:"Country",latest_col:"Holdings ($bn)"})
-    out["Country"]=out["Country"].astype(str).str.replace(r"\s*\d+/.*$","",regex=True).str.strip(); out["Holdings ($bn)"]=pd.to_numeric(out["Holdings ($bn)"],errors="coerce")
+    latest_col=value_cols[0]; out=table[[country_col,latest_col]].rename(columns={country_col:"Country",latest_col:"Holdings ($bn)"})
+    out["Country"]=out["Country"].astype(str).str.replace(r"\s*\d+/.*$","",regex=True).str.strip(); out["Holdings ($bn)"]=pd.to_numeric(out["Holdings ($bn)"].astype(str).str.replace(",",""),errors="coerce")
     out=out.dropna().query("`Holdings ($bn)` > 0"); out=out[~out["Country"].str.contains("Total|All Other|Grand",case=False,na=False)]
     return out.sort_values("Holdings ($bn)",ascending=False),str(latest_col)
 
@@ -123,11 +147,12 @@ def load_foreign_holders():
 def load_stakeholder_holdings():
     """Latest Federal Reserve Financial Accounts F3.2.s holder levels, $bn."""
     url="https://www.federalreserve.gov/releases/z1/current/html/F3_2_s.htm"
-    response=requests.get(url,timeout=25); response.raise_for_status(); tables=pd.read_html(StringIO(response.text))
-    table=next(t for t in tables if any("Series" in str(c) for c in t.columns) and len(t)>10)
-    table.columns=[" ".join(str(v) for v in c if str(v)!="nan").strip() if isinstance(c,tuple) else str(c) for c in table.columns]
+    response=requests.get(url,timeout=25); response.raise_for_status(); tables=html_tables(response.text)
+    rows=next(t for t in tables if any(any("Series"==cell or "Series" in cell for cell in row) for row in t) and len(t)>10)
+    header_index=next(i for i,row in enumerate(rows) if any("Series"==cell or "Series" in cell for cell in row)); header=rows[header_index]; width=len(header)
+    data=[row[:width]+[""]*max(0,width-len(row)) for row in rows[header_index+1:] if len(row)>=3]; table=pd.DataFrame(data,columns=header)
     series_col=next(c for c in table.columns if "series" in c.lower()); desc_col=next(c for c in table.columns if "description" in c.lower())
-    numeric_cols=[c for c in table.columns if c not in [series_col,desc_col] and "line" not in c.lower() and pd.to_numeric(table[c],errors="coerce").notna().sum()>5]
+    numeric_cols=[c for c in table.columns if c not in [series_col,desc_col] and "line" not in c.lower() and pd.to_numeric(table[c].astype(str).str.replace(",",""),errors="coerce").notna().sum()>5]
     if not numeric_cols: raise ValueError("Federal Reserve table did not contain quarterly levels.")
     latest_col=numeric_cols[-1]
     targets={
@@ -137,7 +162,7 @@ def load_stakeholder_holdings():
     for code,label in targets.items():
         match=table[table[series_col].astype(str).str.contains(code,regex=False,na=False)]
         if not match.empty:
-            value=pd.to_numeric(match.iloc[0][latest_col],errors="coerce")
+            value=pd.to_numeric(str(match.iloc[0][latest_col]).replace(",",""),errors="coerce")
             if pd.notna(value): rows.append({"Stakeholder":label,"Holdings ($bn)":float(value)})
     if len(rows)<5: raise ValueError("Federal Reserve holder rows could not be identified.")
     out=pd.DataFrame(rows)
